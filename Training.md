@@ -85,6 +85,16 @@ Idempotency                 Re-run the Ansible playbook                         
 Verification                Run explicit security checks after hardening                                                Generate a report of pass/fail results
 ```
 
+## Which user does ansible use
+
+```bash
+Environment                 SSH user                        SSH private key                           Purpose
+
+Local Vagrant VM            vagrant                         Vagrant-generated private key             Initial connection to your local VM
+AWS EC2                     ubuntu                          ~/.ssh/linux_hardening_ed25519            Initial connection to the Ubuntu EC2 instance
+After hardening             linuxadmin is created           ~/.ssh/linux_hardening_ed25519            Dedicated administrative account for future access
+```
+
 ## Build plan
 
 ```text
@@ -1176,3 +1186,472 @@ ansible-vault view ansible/group_vars/vault.yml
 Phase 1: Local hardening baseline
 
 Completed — Ansible tasks are idempotent, and the security validation playbook passes
+
+## Choose a safe SSH access range
+
+- The AWS security group should allow SSH only from your public IP using a /32 CIDR, rather than exposing port 22 to everyone.
+
+```bash
+# Display your current public IPv4 address.
+curl -4 https://checkip.amazonaws.com
+```
+
+## We'll build a small, cost-conscious initial deployment with -
+
+- One Ubuntu Linux EC2 instance.
+- A dedicated VPC and public subnet.
+- SSH access restricted to your public IP.
+- An existing SSH public key, without uploading or committing the private key.
+- Terraform variables and outputs, with state and local configuration files excluded from Git.
+
+## Create the Terraform files for AWS provisioning
+
+- versions.tf — Terraform and AWS provider
+
+```bash
+cat > aws/terraform/versions.tf <<'EOF'
+terraform {
+  # Require a modern Terraform version.
+  required_version = ">= 1.5.0"
+
+  required_providers {
+    aws = {
+      source  = "hashicorp/aws"
+      version = "~> 5.0"
+    }
+  }
+}
+
+# Use the region configured in terraform.tfvars.
+provider "aws" {
+  region = var.aws_region
+}
+EOF
+```
+
+- variables.tf — Reusable configuration
+
+```bash
+cat > aws/terraform/variables.tf <<'EOF'
+variable "aws_region" {
+  description = "AWS region where the Linux hardening lab will be deployed."
+  type        = string
+  default     = "us-east-1"
+}
+
+variable "project_name" {
+  description = "Prefix used to identify resources belonging to this project."
+  type        = string
+  default     = "linux-hardening"
+}
+
+variable "instance_type" {
+  description = "EC2 instance type. Check current pricing and eligibility before deployment."
+  type        = string
+  default     = "t3.micro"
+}
+
+variable "trusted_ssh_cidr" {
+  description = "Trusted public IPv4 CIDR permitted to connect over SSH."
+  type        = string
+
+  # Require a narrowly scoped IPv4 CIDR instead of an unrestricted rule.
+  validation {
+    condition     = can(cidrnetmask(var.trusted_ssh_cidr)) && can(regex("/32$", var.trusted_ssh_cidr))
+    error_message = "Use one trusted IPv4 address in /32 format, such as 203.0.113.10/32."
+  }
+}
+
+variable "public_key_path" {
+  description = "Path to the SSH public key on the machine running Terraform."
+  type        = string
+  default     = "~/.ssh/linux_hardening_ed25519.pub"
+}
+EOF
+```
+
+- main.tf — Network and Linux server
+
+```bash
+cat > aws/terraform/main.tf <<'EOF'
+# Find a current Ubuntu 22.04 LTS x86_64 AMI published by Canonical.
+data "aws_ami" "ubuntu" {
+  most_recent = true
+  owners      = ["099720109477"]
+
+  filter {
+    name   = "name"
+    values = ["ubuntu/images/hvm-ssd/ubuntu-jammy-22.04-amd64-server-*"]
+  }
+
+  filter {
+    name   = "architecture"
+    values = ["x86_64"]
+  }
+
+  filter {
+    name   = "virtualization-type"
+    values = ["hvm"]
+  }
+
+  filter {
+    name   = "root-device-type"
+    values = ["ebs"]
+  }
+}
+
+# Select an available Availability Zone in the chosen region.
+data "aws_availability_zones" "available" {
+  state = "available"
+}
+
+# Create a dedicated network for this lab.
+resource "aws_vpc" "lab" {
+  cidr_block           = "10.40.0.0/16"
+  enable_dns_support   = true
+  enable_dns_hostnames = true
+
+  tags = {
+    Name    = "${var.project_name}-vpc"
+    Project = var.project_name
+  }
+}
+
+# Create a subnet for the Linux server.
+resource "aws_subnet" "public" {
+  vpc_id                  = aws_vpc.lab.id
+  cidr_block              = "10.40.1.0/24"
+  availability_zone       = data.aws_availability_zones.available.names[0]
+  map_public_ip_on_launch = true
+
+  tags = {
+    Name    = "${var.project_name}-public-subnet"
+    Project = var.project_name
+  }
+}
+
+# Provide internet connectivity to the public subnet.
+resource "aws_internet_gateway" "lab" {
+  vpc_id = aws_vpc.lab.id
+
+  tags = {
+    Name    = "${var.project_name}-igw"
+    Project = var.project_name
+  }
+}
+
+# Route internet-bound traffic through the internet gateway.
+resource "aws_route_table" "public" {
+  vpc_id = aws_vpc.lab.id
+
+  route {
+    cidr_block = "0.0.0.0/0"
+    gateway_id = aws_internet_gateway.lab.id
+  }
+
+  tags = {
+    Name    = "${var.project_name}-public-rt"
+    Project = var.project_name
+  }
+}
+
+# Associate the public route table with the subnet.
+resource "aws_route_table_association" "public" {
+  subnet_id      = aws_subnet.public.id
+  route_table_id = aws_route_table.public.id
+}
+
+# Allow SSH only from the trusted public IPv4 address supplied in terraform.tfvars.
+resource "aws_security_group" "linux" {
+  name_prefix = "${var.project_name}-"
+  description = "Restricted SSH access for the Linux hardening lab"
+  vpc_id      = aws_vpc.lab.id
+
+  ingress {
+    description = "SSH from the trusted administrator IP only"
+    from_port   = 22
+    to_port     = 22
+    protocol    = "tcp"
+    cidr_blocks = [var.trusted_ssh_cidr]
+  }
+
+  # Permit outbound traffic for package installation and system updates.
+  egress {
+    description = "Outbound IPv4 traffic"
+    from_port   = 0
+    to_port     = 0
+    protocol    = "-1"
+    cidr_blocks = ["0.0.0.0/0"]
+  }
+
+  tags = {
+    Name    = "${var.project_name}-sg"
+    Project = var.project_name
+  }
+}
+
+# Register the existing public key with AWS; never upload the private key.
+resource "aws_key_pair" "admin" {
+  key_name   = "${var.project_name}-admin"
+  public_key = file(pathexpand(var.public_key_path))
+
+  tags = {
+    Project = var.project_name
+  }
+}
+
+# Deploy the Ubuntu server that Ansible will harden.
+resource "aws_instance" "linux" {
+  ami                         = data.aws_ami.ubuntu.id
+  instance_type               = var.instance_type
+  subnet_id                   = aws_subnet.public.id
+  vpc_security_group_ids      = [aws_security_group.linux.id]
+  key_name                    = aws_key_pair.admin.key_name
+  associate_public_ip_address = true
+
+  # Require IMDSv2 to reduce risks from instance metadata exposure.
+  metadata_options {
+    http_endpoint = "enabled"
+    http_tokens   = "required"
+  }
+
+  # Use an encrypted general-purpose SSD for the operating system.
+  root_block_device {
+    volume_size           = 12
+    volume_type           = "gp3"
+    encrypted             = true
+    delete_on_termination = true
+  }
+
+  tags = {
+    Name    = "${var.project_name}-ubuntu"
+    Project = var.project_name
+    Purpose = "Ansible Linux server hardening lab"
+  }
+
+  depends_on = [aws_route_table_association.public]
+}
+EOF
+```
+
+- outputs.tf — Useful deployment information
+
+```bash
+cat > aws/terraform/outputs.tf <<'EOF'
+# Display the EC2 public IP for SSH and Ansible connectivity.
+output "instance_public_ip" {
+  description = "Public IPv4 address of the Ubuntu server."
+  value       = aws_instance.linux.public_ip
+}
+
+# Display the private address used inside the VPC.
+output "instance_private_ip" {
+  description = "Private IPv4 address of the Ubuntu server."
+  value       = aws_instance.linux.private_ip
+}
+
+# Display the instance ID for AWS CLI operations.
+output "instance_id" {
+  description = "EC2 instance ID."
+  value       = aws_instance.linux.id
+}
+
+# Make the security boundary visible after deployment.
+output "trusted_ssh_cidr" {
+  description = "Public IPv4 CIDR permitted to connect over SSH."
+  value       = var.trusted_ssh_cidr
+}
+
+# Show the command to connect using the local private key.
+output "ssh_command" {
+  description = "Example SSH command for the Ubuntu instance."
+  value       = "ssh -i ~/.ssh/linux_hardening_ed25519 ubuntu@${aws_instance.linux.public_ip}"
+}
+EOF
+```
+
+- terraform.tfvars.example and your local settings. Create a safe template that can be committed, and a local terraform.tfvars file that should remain ignored by Git.
+
+```bash
+# Create a shareable example without your actual IP address.
+cat > aws/terraform/terraform.tfvars.example <<'EOF'
+aws_region       = "us-east-1"
+project_name     = "linux-hardening"
+instance_type    = "t3.micro"
+trusted_ssh_cidr = "203.0.113.10/32" # Replace with your trusted public IPv4 /32.
+public_key_path  = "~/.ssh/linux_hardening_ed25519.pub"
+EOF
+
+# Create your local configuration using the public IP checked earlier.
+cat > aws/terraform/terraform.tfvars <<'EOF'
+aws_region       = "us-east-1"
+project_name     = "linux-hardening"
+instance_type    = "t3.micro"
+trusted_ssh_cidr = "104.9.152.207/32"
+public_key_path  = "~/.ssh/linux_hardening_ed25519.pub"
+EOF
+```
+
+## Validate the config files
+
+```bash
+# Confirm all five Terraform files exist.
+ls -l aws/terraform/
+
+# Format the Terraform configuration.
+terraform -chdir=aws/terraform fmt -recursive
+
+# Initialize the AWS provider.
+terraform -chdir=aws/terraform init
+
+# Check Terraform syntax and provider configuration.
+terraform -chdir=aws/terraform validate
+
+# Preview resources without creating them.
+terraform -chdir=aws/terraform plan
+```
+
+## Create the automated AWS deployment script
+
+- This script will coordinate Terraform and Ansible. It will reuse your existing playbooks and role, and it will stop if a prerequisite fails.
+
+```bash
+# Create a scripts directory for deployment automation.
+mkdir -p scripts
+
+# Create the AWS deployment orchestrator.
+cat > scripts/deploy-aws.sh <<'EOF'
+#!/usr/bin/env bash
+
+# Stop on errors, unset variables, and failures inside pipelines.
+set -Eeuo pipefail
+
+# Resolve the project root so the script works from any directory.
+PROJECT_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+TERRAFORM_DIR="${PROJECT_ROOT}/aws/terraform"
+PUBLIC_KEY="${HOME}/.ssh/linux_hardening_ed25519.pub"
+PRIVATE_KEY="${HOME}/.ssh/linux_hardening_ed25519"
+
+# Temporary inventory is removed automatically when the script exits.
+INVENTORY_FILE="$(mktemp)"
+trap 'rm -f "${INVENTORY_FILE}"' EXIT
+
+cd "${PROJECT_ROOT}"
+
+echo "=== Preflight checks ==="
+
+# Ensure Terraform, Ansible, AWS CLI, and SSH key files are available.
+for command in terraform ansible-playbook aws ssh; do
+  if ! command -v "${command}" >/dev/null 2>&1; then
+    echo "ERROR: Required command not found: ${command}" >&2
+    exit 1
+  fi
+done
+
+if [[ ! -f "${PUBLIC_KEY}" || ! -f "${PRIVATE_KEY}" ]]; then
+  echo "ERROR: Expected SSH key pair was not found in ${HOME}/.ssh." >&2
+  exit 1
+fi
+
+if [[ ! -f "${PROJECT_ROOT}/ansible/group_vars/vault.yml" ]]; then
+  echo "ERROR: Ansible Vault file is missing." >&2
+  exit 1
+fi
+
+# Verify AWS credentials before attempting Terraform operations.
+aws sts get-caller-identity >/dev/null
+
+echo "Preflight checks passed."
+
+echo "=== Terraform initialization and validation ==="
+
+# Initialize the provider and validate the infrastructure configuration.
+terraform -chdir="${TERRAFORM_DIR}" init
+terraform -chdir="${TERRAFORM_DIR}" validate
+
+echo "=== Review infrastructure plan ==="
+
+# Show the proposed changes before creating AWS resources.
+terraform -chdir="${TERRAFORM_DIR}" plan
+
+echo
+echo "Review the plan above. Terraform will ask for confirmation before creating resources."
+read -r -p "Continue to Terraform apply? Type APPLY to proceed: " APPROVAL
+
+if [[ "${APPROVAL}" != "APPLY" ]]; then
+  echo "Deployment cancelled before infrastructure creation."
+  exit 0
+fi
+
+# Terraform asks for its own confirmation unless -auto-approve is used.
+terraform -chdir="${TERRAFORM_DIR}" apply
+
+echo "=== Retrieve the EC2 address ==="
+
+# Read the public IP from Terraform outputs after successful provisioning.
+PUBLIC_IP="$(terraform -chdir="${TERRAFORM_DIR}" output -raw instance_public_ip)"
+
+if [[ -z "${PUBLIC_IP}" ]]; then
+  echo "ERROR: Terraform did not return an instance public IP." >&2
+  exit 1
+fi
+
+echo "EC2 public IP: ${PUBLIC_IP}"
+
+echo "=== Generate temporary Ansible inventory ==="
+
+# Use Ubuntu's default cloud account for the initial connection.
+# accept-new trusts a previously unknown host key on first connection.
+# The inventory itself is temporary and is not committed to Git.
+cat > "${INVENTORY_FILE}" <<INVENTORY
+[linux_servers]
+aws-linux ansible_host=${PUBLIC_IP} ansible_user=ubuntu ansible_python_interpreter=/usr/bin/python3 ansible_ssh_private_key_file=${PRIVATE_KEY} ansible_ssh_common_args='-o StrictHostKeyChecking=accept-new'
+INVENTORY
+
+echo "=== Wait for SSH connectivity ==="
+
+# Wait until the newly created server is reachable over SSH.
+ansible -i "${INVENTORY_FILE}" linux_servers \
+  -m ansible.builtin.wait_for_connection \
+  -a "timeout=600" \
+  -o
+
+echo "=== Apply Linux hardening ==="
+
+# Prompt for the Ansible Vault password without putting it in the command line.
+ansible-playbook \
+  -i "${INVENTORY_FILE}" \
+  ansible/playbooks/harden.yml \
+  --ask-vault-pass
+
+echo "=== Validate the hardening baseline ==="
+
+# Run the existing read-only validation playbook.
+ansible-playbook \
+  -i "${INVENTORY_FILE}" \
+  ansible/playbooks/validate.yml
+
+echo
+echo "Deployment and validation completed successfully."
+echo "EC2 public IP: ${PUBLIC_IP}"
+echo "SSH command: ssh -i ${PRIVATE_KEY} ubuntu@${PUBLIC_IP}"
+echo
+echo "The Ansible inventory was temporary and has been removed."
+echo "Run the hardening playbook a second time to verify idempotency."
+EOF
+
+# Make the script executable.
+chmod +x scripts/deploy-aws.sh
+```
+
+## How the automated run (script) works
+
+1. Terraform initializes and validates the AWS configuration.
+2. Terraform displays its plan, and you explicitly approve continuing.
+3. Terraform asks for confirmation before provisioning.
+4. The script retrieves the instance IP and creates a temporary Ansible inventory.
+5. Ansible waits for SSH, prompts for your Vault password, applies hardening, and runs validation.
+6. The temporary inventory is removed when the script exits.
+
+- Security note: StrictHostKeyChecking=accept-new trusts a new SSH host key on first connection.
+- This is convenient for a disposable lab, but it is trust-on-first-use rather than independent verification of the server's identity.

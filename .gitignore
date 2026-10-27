@@ -1,4 +1,3 @@
-cat > .gitignore <<'EOF'
 # Python virtual environment and bytecode
 .venv/
 __pycache__/
