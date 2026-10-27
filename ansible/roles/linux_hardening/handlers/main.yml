@@ -1,0 +1,5 @@
+# Reload SSH only when the configuration file changes.
+- name: Reload SSH
+  ansible.builtin.service:
+    name: ssh
+    state: reloaded

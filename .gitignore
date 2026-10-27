@@ -1,0 +1,33 @@
+cat > .gitignore <<'EOF'
+# Python virtual environment and bytecode
+.venv/
+__pycache__/
+*.py[cod]
+
+# Terraform local files and state
+**/.terraform/*
+*.tfstate
+*.tfstate.*
+*.tfplan
+crash.log
+terraform.tfvars
+!terraform.tfvars.example
+override.tf
+override.tf.json
+*_override.tf
+*_override.tf.json
+
+# SSH private keys and credentials
+*.pem
+*.key
+id_rsa
+id_ed25519
+.vault-pass
+.env
+
+# Vagrant local state
+.vagrant/
+
+# Ansible runtime files
+*.retry
+ansible/group_vars/vault.yml

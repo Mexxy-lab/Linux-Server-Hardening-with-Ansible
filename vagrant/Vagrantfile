@@ -1,0 +1,78 @@
+VAGRANTFILE_API_VERSION = "2"
+
+$script_create_swapfile = <<-SCRIPT
+#!/bin/sh
+
+swapsize=2080
+
+grep -q "/swapfile" /etc/fstab
+
+if [ $? -ne 0 ]; then
+    echo "swapfile not found. Adding swapfile."
+
+    fallocate -l ${swapsize}M /swapfile
+    chmod 600 /swapfile
+    mkswap /swapfile
+    swapon /swapfile
+
+    echo "/swapfile none swap defaults 0 0" >> /etc/fstab
+
+    echo "✅ Swapfile created successfully."
+else
+    echo "✅ Swapfile already exists. No changes made."
+fi
+
+echo
+echo "==================== SWAP INFORMATION ===================="
+
+cat /proc/swaps
+
+echo
+cat /proc/meminfo | grep Swap
+
+echo "==========================================================="
+SCRIPT
+
+vm_machines = [
+    {
+        :name => "Linux-hardening-vm",
+        :ip   => "192.168.1.130",
+    },
+    # {
+    #     :name => "np-mysql-lvmv9-worker001",
+    #     :ip   => "192.168.1.131",
+    # },
+    # {
+    #     :name => "np-mariadb-lvmv9-worker002",
+    #     :ip   => "192.168.1.132",
+    # },
+]
+
+Vagrant.configure("2") do |config|
+
+    config.vm.box = "ubuntu/jammy64"
+
+    config.disksize.size = "70GB"
+
+    config.vm.provider "virtualbox" do |v|
+        v.memory = 3072
+        v.cpus   = 3
+    end
+
+    config.vm.synced_folder ".", "/vagrant", disabled: true
+
+    vm_machines.each do |vm_machine|
+
+        config.vm.define vm_machine[:name] do |vm|
+
+            vm.vm.hostname = vm_machine[:name]
+
+            vm.vm.network "public_network",
+                ip: vm_machine[:ip]
+
+            vm.vm.provision "shell",
+                inline: $script_create_swapfile
+
+        end
+    end
+end

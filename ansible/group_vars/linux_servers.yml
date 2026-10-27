@@ -1,0 +1,30 @@
+---
+# Shared security baseline for Ubuntu Linux servers across environments.
+
+# Dedicated administrator account.
+linux_hardening_admin_user: linuxadmin
+linux_hardening_admin_shell: /bin/bash
+
+# Public key on the Ansible controller; never copy the private key.
+linux_hardening_admin_public_key_file: "{{ lookup('env', 'HOME') }}/.ssh/linux_hardening_ed25519.pub"
+
+# SSH security settings.
+linux_hardening_ssh_port: 22
+linux_hardening_ssh_password_authentication: "no"
+linux_hardening_ssh_permit_root_login: "no"
+linux_hardening_ssh_pubkey_authentication: "yes"
+
+# UFW policy: deny inbound traffic by default and allow outbound traffic.
+linux_hardening_ufw_default_incoming_policy: deny
+linux_hardening_ufw_default_outgoing_policy: allow
+
+# Permit SSH through the host firewall.
+linux_hardening_ufw_allowed_tcp_ports:
+  - "{{ linux_hardening_ssh_port }}"
+
+# Install automatic updates, but do not force automatic reboots.
+linux_hardening_security_updates_enabled: true
+linux_hardening_automatic_reboot_enabled: false
+
+# The role currently installs and starts Chrony.
+linux_hardening_time_sync_service: chrony

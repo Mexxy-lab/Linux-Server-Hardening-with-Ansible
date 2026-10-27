@@ -1,0 +1,21 @@
+linux_hardening_admin_shell: /bin/bash
+
+# Public key on the Ansible controller; only this public key is installed remotely.
+linux_hardening_admin_public_key_file: "{{ lookup('env', 'HOME') }}/.ssh/linux_hardening_ed25519.pub"
+
+# SSH settings used by the later hardening tasks.
+linux_hardening_ssh_port: 22
+linux_hardening_ssh_password_authentication: "no"
+linux_hardening_ssh_permit_root_login: "no"
+linux_hardening_ssh_pubkey_authentication: "yes"
+
+# UFW policy; the firewall will be enabled in a later stage.
+linux_hardening_ufw_default_incoming_policy: deny
+linux_hardening_ufw_default_outgoing_policy: allow
+linux_hardening_ufw_allowed_tcp_ports:
+  - "{{ linux_hardening_ssh_port }}"
+
+# Maintenance settings.
+linux_hardening_security_updates_enabled: true
+linux_hardening_automatic_reboot_enabled: false
+linux_hardening_time_sync_service: chrony

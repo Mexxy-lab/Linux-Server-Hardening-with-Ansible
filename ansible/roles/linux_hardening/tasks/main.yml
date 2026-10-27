@@ -1,0 +1,146 @@
+---
+# Confirm that this role is being applied to the expected operating system.
+- name: Confirm that the target is Ubuntu with systemd
+  ansible.builtin.assert:
+    that:
+      - ansible_facts['distribution'] == "Ubuntu"
+      - ansible_facts['service_mgr'] == "systemd"
+    fail_msg: "This baseline expects Ubuntu with systemd."
+
+# Validate the SSH port before it is used in firewall rules.
+- name: Confirm that the SSH port is valid
+  ansible.builtin.assert:
+    that:
+      - linux_hardening_ssh_port | int >= 1
+      - linux_hardening_ssh_port | int <= 65535
+    fail_msg: "linux_hardening_ssh_port must be a valid TCP port."
+
+# Check the public key on the controller before changing the server.
+- name: Verify that the administrator public key exists
+  ansible.builtin.stat:
+    path: "{{ linux_hardening_admin_public_key_file }}"
+  delegate_to: localhost
+  become: false
+  register: linux_hardening_public_key_stat
+
+# Stop if the public key is missing or is not a regular file.
+- name: Require the administrator public key
+  ansible.builtin.assert:
+    that:
+      - linux_hardening_public_key_stat.stat.exists
+      - linux_hardening_public_key_stat.stat.isreg
+    fail_msg: "The administrator public key was not found on the controller."
+
+# Refresh package metadata before installing the required utilities.
+- name: Update APT package metadata
+  ansible.builtin.apt:
+    update_cache: true
+    cache_valid_time: 3600
+
+# Install the firewall, time-sync, and unattended-upgrade utilities.
+- name: Install baseline security packages
+  ansible.builtin.apt:
+    name:
+      - chrony
+      - ufw
+      - unattended-upgrades
+    state: present
+
+# Configure APT to check for and install unattended updates daily.
+- name: Configure automatic APT updates
+  ansible.builtin.template:
+    src: 20auto-upgrades.j2
+    dest: /etc/apt/apt.conf.d/20auto-upgrades
+    owner: root
+    group: root
+    mode: "0644"
+
+# Explicitly prevent unattended security updates from rebooting the server.
+- name: Disable automatic reboots after unattended upgrades
+  ansible.builtin.template:
+    src: 52linux-hardening-unattended-upgrades.j2
+    dest: /etc/apt/apt.conf.d/52linux-hardening-unattended-upgrades
+    owner: root
+    group: root
+    mode: "0644"
+
+# Create the administrative account using the password hash stored in Vault.
+- name: Create the Linux administration account
+  ansible.builtin.user:
+    name: "{{ linux_hardening_admin_user }}"
+    shell: "{{ linux_hardening_admin_shell }}"
+    create_home: true
+    groups:
+      - sudo
+    append: true
+    password: "{{ linux_admin_password_hash }}"
+    update_password: on_create
+    state: present
+  no_log: true
+
+# Install the public key without copying the private key to the server.
+- name: Install the administrator SSH public key
+  ansible.posix.authorized_key:
+    user: "{{ linux_hardening_admin_user }}"
+    state: present
+    key: "{{ lookup('file', linux_hardening_admin_public_key_file) }}"
+
+# Start time synchronization without changing SSH or firewall settings.
+- name: Enable and start Chrony
+  ansible.builtin.service:
+    name: chrony
+    enabled: true
+    state: started
+
+# Validate firewall policies before using them to configure UFW.
+- name: Validate UFW default policies
+  ansible.builtin.assert:
+    that:
+      - linux_hardening_ufw_default_incoming_policy in ['allow', 'deny', 'reject']
+      - linux_hardening_ufw_default_outgoing_policy in ['allow', 'deny', 'reject']
+    fail_msg: "UFW default policies must be allow, deny, or reject."
+
+# Deny unsolicited inbound connections by default.
+- name: Set UFW default incoming policy
+  community.general.ufw:
+    direction: incoming
+    policy: deny
+
+# Allow outbound connections by default.
+- name: Set UFW default outgoing policy
+  community.general.ufw:
+    direction: outgoing
+    policy: allow
+
+# Explicitly allow SSH before activating the firewall.
+- name: Allow SSH through UFW
+  community.general.ufw:
+    rule: allow
+    port: "{{ linux_hardening_ssh_port | string }}"
+    proto: tcp
+
+# Apply SSH hardening in a dedicated configuration drop-in.
+- name: Apply the SSH hardening configuration
+  ansible.builtin.copy:
+    dest: /etc/ssh/sshd_config.d/00-linux-hardening.conf
+    owner: root
+    group: root
+    mode: "0644"
+
+    # Render SSH settings from the shared Ansible variables.
+    content: |
+      Port {{ linux_hardening_ssh_port }}
+      PermitRootLogin {{ linux_hardening_ssh_permit_root_login }}
+      PasswordAuthentication {{ linux_hardening_ssh_password_authentication }}
+      PubkeyAuthentication {{ linux_hardening_ssh_pubkey_authentication }}
+
+    # Validate the candidate configuration before installing it.
+    validate: "/usr/sbin/sshd -t -f %s"
+
+  # Notify is a task-level directive, outside the copy parameters.
+  notify: Reload SSH
+
+# Enable UFW only after the default policies and SSH allow rule are configured.
+- name: Enable UFW firewall
+  community.general.ufw:
+    state: enabled

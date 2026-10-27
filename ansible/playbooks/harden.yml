@@ -1,0 +1,13 @@
+---
+- name: Apply the Linux server hardening baseline
+  hosts: linux_servers
+  become: true
+  gather_facts: true
+
+  # Load the project defaults and encrypted administrator password hash.
+  vars_files:
+    - ../group_vars/linux_servers.yml
+    - ../group_vars/vault.yml
+
+  roles:
+    - linux_hardening

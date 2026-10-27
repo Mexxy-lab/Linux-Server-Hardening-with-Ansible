@@ -1,0 +1,124 @@
+---
+# Validate the security baseline without changing the server.
+- name: Validate Linux server hardening
+  hosts: linux_servers
+  become: true
+  gather_facts: true
+
+  # Reuse the same settings as the hardening role.
+  vars_files:
+    - ../group_vars/linux_servers.yml
+
+  tasks:
+    # Confirm that the target operating system is supported.
+    - name: Verify Ubuntu operating system
+      ansible.builtin.assert:
+        that:
+          - ansible_facts['distribution'] == "Ubuntu"
+        fail_msg: "Validation failed: target is not Ubuntu."
+        success_msg: "PASS: Target operating system is Ubuntu."
+
+    # Read the effective SSH configuration, not just the config file.
+    - name: Read effective SSH security settings
+      ansible.builtin.command: /usr/sbin/sshd -T
+      register: ssh_effective_config
+      changed_when: false
+
+    # Verify that SSH enforces the expected access controls.
+    - name: Verify SSH hardening
+      ansible.builtin.assert:
+        that:
+          - "'port ' ~ (linux_hardening_ssh_port | string) in ssh_effective_config.stdout_lines"
+          - "'permitrootlogin ' ~ linux_hardening_ssh_permit_root_login in ssh_effective_config.stdout_lines"
+          - "'passwordauthentication ' ~ linux_hardening_ssh_password_authentication in ssh_effective_config.stdout_lines"
+          - "'pubkeyauthentication ' ~ linux_hardening_ssh_pubkey_authentication in ssh_effective_config.stdout_lines"
+        fail_msg: "FAIL: Effective SSH settings do not match the baseline."
+        success_msg: "PASS: Effective SSH settings match the baseline."
+
+    # Check UFW's runtime status and configured default policies.
+    - name: Read UFW status
+      ansible.builtin.command: /usr/sbin/ufw status verbose
+      register: ufw_status
+      changed_when: false
+
+    # Fail if the firewall is inactive or the default policies are wrong.
+    - name: Verify UFW firewall
+      ansible.builtin.assert:
+        that:
+          # Confirm UFW is running.
+          - "'Status: active' in ufw_status.stdout"
+
+          # Confirm the expected incoming default policy.
+          - "'Default: ' ~ linux_hardening_ufw_default_incoming_policy ~ ' (incoming)' in ufw_status.stdout"
+
+          # Confirm the expected outgoing default policy.
+          - "' ' ~ linux_hardening_ufw_default_outgoing_policy ~ ' (outgoing)' in ufw_status.stdout"
+
+          # Match the SSH rule even when the port starts at column one.
+          - "ufw_status.stdout is regex('(?m)^\\s*' ~ (linux_hardening_ssh_port | string) ~ '/tcp\\s+ALLOW IN\\s+')"
+
+        fail_msg: "FAIL: UFW is inactive or its expected policies/rules are missing."
+        success_msg: "PASS: UFW is active with expected policies and SSH rule."
+
+    # Read the unattended-upgrades configuration without modifying it.
+    - name: Read automatic update configuration
+      ansible.builtin.command:
+        argv:
+          - /usr/bin/grep
+          - -E
+          - 'APT::Periodic::(Update-Package-Lists|Unattended-Upgrade)'
+          - /etc/apt/apt.conf.d/20auto-upgrades
+      register: apt_auto_updates
+      changed_when: false
+
+    # Read the automatic reboot policy from the managed configuration file.
+    - name: Read automatic reboot policy
+      ansible.builtin.command:
+        argv:
+          - /usr/bin/grep
+          - -E
+          - '^Unattended-Upgrade::Automatic-Reboot'
+          - /etc/apt/apt.conf.d/52linux-hardening-unattended-upgrades
+      register: apt_reboot_policy
+      changed_when: false
+
+    # Confirm daily update checks and unattended upgrades are enabled.
+    - name: Verify automatic updates and reboot policy
+      ansible.builtin.assert:
+        that:
+          - "'APT::Periodic::Update-Package-Lists \"1\";' in apt_auto_updates.stdout"
+          - "'APT::Periodic::Unattended-Upgrade \"1\";' in apt_auto_updates.stdout"
+          - "'Unattended-Upgrade::Automatic-Reboot \"' ~ (linux_hardening_automatic_reboot_enabled | bool | lower | string) ~ '\";' in apt_reboot_policy.stdout"
+        fail_msg: "FAIL: Automatic update or reboot settings do not match the baseline."
+        success_msg: "PASS: Automatic updates and reboot policy match the baseline."
+
+    # Check that the configured time synchronization service is running.
+    - name: Verify time synchronization service
+      ansible.builtin.command:
+        argv:
+          - /usr/bin/systemctl
+          - is-active
+          - "{{ linux_hardening_time_sync_service }}"
+      register: time_sync_active
+      changed_when: false
+      failed_when: false
+
+    # Check that the time synchronization service starts at boot.
+    - name: Verify time synchronization service is enabled
+      ansible.builtin.command:
+        argv:
+          - /usr/bin/systemctl
+          - is-enabled
+          - "{{ linux_hardening_time_sync_service }}"
+      register: time_sync_enabled
+      changed_when: false
+      failed_when: false
+
+    # Fail validation if the service is stopped or disabled.
+    - name: Confirm time synchronization service health
+      ansible.builtin.assert:
+        that:
+          - time_sync_active.stdout == "active"
+          - time_sync_enabled.stdout == "enabled"
+        fail_msg: "FAIL: Time synchronization service is not active and enabled."
+        success_msg: "PASS: Time synchronization service is active and enabled."

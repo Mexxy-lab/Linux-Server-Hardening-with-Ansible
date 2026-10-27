@@ -1,0 +1,2 @@
+{# Keep automatic reboots controlled by the shared Ansible variable. #}
+Unattended-Upgrade::Automatic-Reboot "{{ linux_hardening_automatic_reboot_enabled | bool | lower }}";
