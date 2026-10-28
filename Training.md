@@ -568,6 +568,10 @@ grep -qxF 'ansible/group_vars/vault.yml' .gitignore \
 
 # Verify that the vault file exists without printing its contents.
 ls -l ansible/group_vars/vault.yml
+
+# Used to decrypt encryoted password for linuxadmin user
+mkpasswd --method=sha-512
+ansible-vault edit ansible/group_vars/vault.yml           
 ```
 
 ## Configure the administrator account
