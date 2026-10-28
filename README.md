@@ -2,7 +2,7 @@
 
 ## Overview
 
-![alt text](Pictures/linux.png)
+![alt text](Pictures/architecture.png)
 
 This project automates a baseline of Linux server security controls using Ansible. The goal is to build a reusable, repeatable hardening role that can be applied to Linux servers in local virtual machines and, eventually, AWS and Azure environments.
 

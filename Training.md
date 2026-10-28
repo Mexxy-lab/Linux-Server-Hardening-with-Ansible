@@ -1181,7 +1181,7 @@ ansible-vault rekey ansible/group_vars/vault.yml
 ansible-vault view ansible/group_vars/vault.yml
 ```
 
-## Phase 2 — Make the project portable across environments
+## Phase 2 — Make the project portable across environments - AWS
 
 Phase 1: Local hardening baseline
 
@@ -1655,3 +1655,649 @@ chmod +x scripts/deploy-aws.sh
 
 - Security note: StrictHostKeyChecking=accept-new trusts a new SSH host key on first connection.
 - This is convenient for a disposable lab, but it is trust-on-first-use rather than independent verification of the server's identity.
+
+## Phase 3 — Make the project portable across environments - Azure
+
+- The workflow will be:
+
+1. Azure CLI authenticates to your subscription.
+2. Terraform creates the Azure networking and Ubuntu VM.
+3. Ansible connects as azureuser using your existing SSH key.
+4. Ansible applies the shared hardening role and creates linuxadmin.
+5. The validation playbook checks the final configuration.
+
+- We'll use Standard_B1s as the initial low-cost VM size, but confirm that it's available and appropriate for your subscription and region before deployment. Azure resources can incur charges.
+
+## Create the Azure project files
+
+```bash
+# Create the Azure Terraform directory.
+mkdir -p azure/terraform
+
+touch main.tf outputs.tf terraform.tfvars.example variables.tf versions.tf
+
+# Create the Terraform provider and version requirements.
+cat > azure/terraform/versions.tf <<'EOF'
+terraform {
+  # Keep the project compatible with modern Terraform releases.
+  required_version = ">= 1.5.0"
+
+  required_providers {
+    azurerm = {
+      source  = "hashicorp/azurerm"
+      version = "~> 4.0"
+    }
+  }
+}
+
+# The deployment script supplies ARM_SUBSCRIPTION_ID from Azure CLI.
+provider "azurerm" {
+  features {}
+}
+EOF
+
+# Define the Azure deployment inputs.
+cat > azure/terraform/variables.tf <<'EOF'
+variable "location" {
+  description = "Azure region for the Linux hardening lab."
+  type        = string
+  default     = "eastus"
+}
+
+variable "project_name" {
+  description = "Prefix used to name this project's Azure resources."
+  type        = string
+  default     = "linux-hardening"
+}
+
+variable "vm_size" {
+  description = "Azure VM size; verify availability, quota, and pricing."
+  type        = string
+  default     = "Standard_B1s"
+}
+
+variable "trusted_ssh_cidr" {
+  description = "Trusted public IPv4 address allowed to connect over SSH."
+  type        = string
+
+  # Restrict SSH to one public IPv4 address instead of the entire internet.
+  validation {
+    condition = (
+      can(cidrnetmask(var.trusted_ssh_cidr)) &&
+      can(regex("/32$", var.trusted_ssh_cidr))
+    )
+    error_message = "Use a single trusted IPv4 address in /32 format."
+  }
+}
+
+variable "public_key_path" {
+  description = "Path to the SSH public key used for VM access."
+  type        = string
+  default     = "~/.ssh/linux_hardening_ed25519.pub"
+}
+EOF
+
+# Define the Azure network, security rules, and Ubuntu VM.
+cat > azure/terraform/main.tf <<'EOF'
+# Create a dedicated resource group for this lab.
+resource "azurerm_resource_group" "lab" {
+  name     = "${var.project_name}-rg"
+  location = var.location
+
+  tags = {
+    project     = var.project_name
+    environment = "lab"
+    managed_by  = "terraform"
+  }
+}
+
+# Create a private address space for the VM.
+resource "azurerm_virtual_network" "lab" {
+  name                = "${var.project_name}-vnet"
+  address_space       = ["10.50.0.0/16"]
+  location            = azurerm_resource_group.lab.location
+  resource_group_name = azurerm_resource_group.lab.name
+}
+
+# Place the Ubuntu VM in a dedicated subnet.
+resource "azurerm_subnet" "lab" {
+  name                 = "${var.project_name}-subnet"
+  resource_group_name  = azurerm_resource_group.lab.name
+  virtual_network_name = azurerm_virtual_network.lab.name
+  address_prefixes     = ["10.50.1.0/24"]
+}
+
+# Permit inbound SSH only from the trusted public IPv4 address.
+# Azure's default NSG rules deny other unsolicited inbound traffic.
+resource "azurerm_network_security_group" "lab" {
+  name                = "${var.project_name}-nsg"
+  location            = azurerm_resource_group.lab.location
+  resource_group_name = azurerm_resource_group.lab.name
+
+  security_rule {
+    name                       = "Allow-SSH-From-Trusted-IP"
+    priority                   = 100
+    direction                  = "Inbound"
+    access                     = "Allow"
+    protocol                   = "Tcp"
+    source_port_range          = "*"
+    destination_port_range     = "22"
+    source_address_prefix      = var.trusted_ssh_cidr
+    destination_address_prefix = "*"
+  }
+
+  tags = {
+    project = var.project_name
+  }
+}
+
+# Assign a public IP so Ansible can reach the VM over SSH.
+resource "azurerm_public_ip" "lab" {
+  name                = "${var.project_name}-pip"
+  location            = azurerm_resource_group.lab.location
+  resource_group_name = azurerm_resource_group.lab.name
+  allocation_method   = "Static"
+  sku                 = "Standard"
+
+  tags = {
+    project = var.project_name
+  }
+}
+
+# Connect the VM to the subnet and public IP.
+resource "azurerm_network_interface" "lab" {
+  name                = "${var.project_name}-nic"
+  location            = azurerm_resource_group.lab.location
+  resource_group_name = azurerm_resource_group.lab.name
+
+  ip_configuration {
+    name                          = "internal"
+    subnet_id                     = azurerm_subnet.lab.id
+    private_ip_address_allocation = "Dynamic"
+    public_ip_address_id          = azurerm_public_ip.lab.id
+  }
+
+  tags = {
+    project = var.project_name
+  }
+}
+
+# Apply the SSH network security group to the VM's network interface.
+resource "azurerm_network_interface_security_group_association" "lab" {
+  network_interface_id      = azurerm_network_interface.lab.id
+  network_security_group_id = azurerm_network_security_group.lab.id
+}
+
+# Create the Ubuntu 22.04 LTS virtual machine.
+resource "azurerm_linux_virtual_machine" "lab" {
+  name                = "${var.project_name}-vm"
+  computer_name       = "linux-hardening"
+  resource_group_name = azurerm_resource_group.lab.name
+  location            = azurerm_resource_group.lab.location
+  size                = var.vm_size
+  admin_username      = "azureuser"
+
+  # Use SSH public-key authentication; do not configure a VM password.
+  disable_password_authentication = true
+  network_interface_ids           = [azurerm_network_interface.lab.id]
+
+  admin_ssh_key {
+    username   = "azureuser"
+    public_key = file(pathexpand(var.public_key_path))
+  }
+
+  # Use a 30 GiB standard SSD/HDD-compatible managed OS disk.
+  os_disk {
+    name                 = "${var.project_name}-osdisk"
+    caching              = "ReadWrite"
+    storage_account_type = "Standard_LRS"
+    disk_size_gb         = 30
+  }
+
+  # Select the Canonical Ubuntu Server 22.04 LTS Gen2 image.
+  source_image_reference {
+    publisher = "Canonical"
+    offer     = "0001-com-ubuntu-server-jammy"
+    sku       = "22_04-lts-gen2"
+    version   = "latest"
+  }
+
+  # Require IMDSv2-style metadata access protections where supported by Azure.
+  # Azure's managed VM metadata service is not directly equivalent to AWS IMDSv2.
+  # The VM uses Azure platform defaults for instance metadata.
+
+  tags = {
+    project     = var.project_name
+    environment = "lab"
+    managed_by  = "terraform"
+  }
+}
+EOF
+
+# Expose connection details after Terraform creates the VM.
+cat > azure/terraform/outputs.tf <<'EOF'
+output "resource_group_name" {
+  description = "Resource group containing the lab resources."
+  value       = azurerm_resource_group.lab.name
+}
+
+output "vm_name" {
+  description = "Name of the Ubuntu virtual machine."
+  value       = azurerm_linux_virtual_machine.lab.name
+}
+
+output "public_ip" {
+  description = "Public IPv4 address used by Ansible and SSH."
+  value       = azurerm_public_ip.lab.ip_address
+}
+
+output "private_ip" {
+  description = "Private IPv4 address assigned to the VM."
+  value       = azurerm_network_interface.lab.private_ip_address
+}
+
+output "trusted_ssh_cidr" {
+  description = "CIDR permitted to access SSH through the NSG."
+  value       = var.trusted_ssh_cidr
+}
+
+output "ssh_command" {
+  description = "Example command for the initial Azure administrator."
+  value       = "ssh -i ~/.ssh/linux_hardening_ed25519 azureuser@${azurerm_public_ip.lab.ip_address}"
+}
+EOF
+
+# Provide a safe example; replace the example IP before using it.
+cat > azure/terraform/terraform.tfvars.example <<'EOF'
+location        = "eastus"
+project_name    = "linux-hardening"
+subscription_id  = "00000000-0000-0000-0000-000000000000"
+vm_size         = "Standard_B1s"
+trusted_ssh_cidr = "203.0.113.10/32"
+public_key_path = "~/.ssh/linux_hardening_ed25519.pub"
+EOF
+```
+
+## Create the automated Azure deployment script
+
+- This script will authenticate through your existing Azure CLI session, validate the Ansible playbooks before creating resources, show you the Terraform plan, and require your approval before applying it.
+
+```bash
+# Create the Azure deployment script.
+cat > scripts/deploy-azure.sh <<'EOF'
+#!/usr/bin/env bash
+
+# Stop if a command fails, an unset variable is used, or a pipeline fails.
+set -Eeuo pipefail
+
+# Resolve paths relative to the repository, not the current working directory.
+PROJECT_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+TERRAFORM_DIR="${PROJECT_ROOT}/azure/terraform"
+PUBLIC_KEY="${HOME}/.ssh/linux_hardening_ed25519.pub"
+PRIVATE_KEY="${HOME}/.ssh/linux_hardening_ed25519"
+
+# Keep generated inventory temporary and remove it when the script exits.
+INVENTORY_FILE="$(mktemp)"
+trap 'rm -f "${INVENTORY_FILE}"' EXIT
+
+cd "${PROJECT_ROOT}"
+
+echo "=== Preflight checks ==="
+
+# Confirm the tools needed for Azure provisioning and Ansible are installed.
+for command in terraform ansible ansible-playbook az ssh; do
+  if ! command -v "${command}" >/dev/null 2>&1; then
+    echo "ERROR: Required command not found: ${command}" >&2
+    exit 1
+  fi
+done
+
+# Require the existing SSH key pair used by the AWS and local lab.
+if [[ ! -f "${PUBLIC_KEY}" || ! -f "${PRIVATE_KEY}" ]]; then
+  echo "ERROR: SSH key pair not found under ${HOME}/.ssh." >&2
+  exit 1
+fi
+
+# Confirm that the Ansible Vault file exists without displaying its contents.
+if [[ ! -f "${PROJECT_ROOT}/ansible/group_vars/vault.yml" ]]; then
+  echo "ERROR: Ansible Vault file is missing." >&2
+  exit 1
+fi
+
+# Confirm Azure CLI is logged in and identify the active subscription.
+if ! az account show >/dev/null 2>&1; then
+  echo "ERROR: Azure CLI is not logged in. Run: az login" >&2
+  exit 1
+fi
+
+echo "Active Azure subscription:"
+az account show --query '{name:name,id:id}' --output table
+
+echo
+echo "=== Ansible preflight checks ==="
+
+# Validate hardening playbook syntax and the Vault password before provisioning.
+ansible-playbook \
+  -i ansible/inventories/vagrant/hosts.yml \
+  ansible/playbooks/harden.yml \
+  --syntax-check \
+  --ask-vault-pass
+
+# Validate the read-only verification playbook.
+ansible-playbook \
+  -i ansible/inventories/vagrant/hosts.yml \
+  ansible/playbooks/validate.yml \
+  --syntax-check
+
+echo
+echo "=== Terraform initialization and validation ==="
+
+# Initialize the Azure provider and validate the configuration.
+terraform -chdir="${TERRAFORM_DIR}" init
+terraform -chdir="${TERRAFORM_DIR}" validate
+
+echo
+echo "=== Review the Azure deployment plan ==="
+
+# Show planned resource changes without creating anything yet.
+terraform -chdir="${TERRAFORM_DIR}" plan
+
+echo
+read -r -p "Type APPLY to create the Azure resources: " APPROVAL
+
+# Require explicit approval before provisioning potentially billable resources.
+if [[ "${APPROVAL}" != "APPLY" ]]; then
+  echo "Deployment cancelled before resource creation."
+  exit 0
+fi
+
+# Apply the reviewed Terraform plan; Terraform will request confirmation again.
+terraform -chdir="${TERRAFORM_DIR}" apply
+
+echo
+echo "=== Retrieve the VM public IP ==="
+
+# Read the VM address from Terraform after a successful apply.
+PUBLIC_IP="$(terraform -chdir="${TERRAFORM_DIR}" output -raw public_ip)"
+
+if [[ -z "${PUBLIC_IP}" ]]; then
+  echo "ERROR: Terraform did not return a public IP." >&2
+  exit 1
+fi
+
+echo "Azure VM public IP: ${PUBLIC_IP}"
+
+echo
+echo "=== Generate temporary Ansible inventory ==="
+
+# Use Azure's initial account for the first connection.
+# accept-new trusts the host key on first contact and remembers it for this host.
+cat > "${INVENTORY_FILE}" <<INVENTORY
+[linux_servers]
+azure-linux ansible_host=${PUBLIC_IP} ansible_user=azureuser ansible_python_interpreter=/usr/bin/python3 ansible_ssh_private_key_file=${PRIVATE_KEY} ansible_ssh_common_args='-o StrictHostKeyChecking=accept-new'
+INVENTORY
+
+echo
+echo "=== Wait for SSH connectivity ==="
+
+# Wait for the new Ubuntu VM to become reachable before running configuration.
+ansible -i "${INVENTORY_FILE}" linux_servers \
+  -m ansible.builtin.wait_for_connection \
+  -a "timeout=600" \
+  -o
+
+echo
+echo "=== Apply the shared Linux hardening role ==="
+
+# Re-enter the Vault password to decrypt the administrator password hash.
+ansible-playbook \
+  -i "${INVENTORY_FILE}" \
+  ansible/playbooks/harden.yml \
+  --ask-vault-pass
+
+echo
+echo "=== Validate the hardened VM ==="
+
+# Run the read-only checks against the Azure VM.
+ansible-playbook \
+  -i "${INVENTORY_FILE}" \
+  ansible/playbooks/validate.yml
+
+echo
+echo "Azure deployment and validation completed successfully."
+echo "VM public IP: ${PUBLIC_IP}"
+echo "Initial SSH command: ssh -i ${PRIVATE_KEY} azureuser@${PUBLIC_IP}"
+echo "Dedicated admin account created by Ansible: linuxadmin"
+echo "Temporary inventory will be removed when this script exits."
+echo
+echo "Next: verify linuxadmin SSH access and rerun hardening to test idempotency."
+EOF
+
+# Mark the deployment script as executable.
+chmod +x scripts/deploy-azure.sh
+```
+
+## Prepare the local azure settings and create tfvars file
+
+```bash
+python3 <<'PY'
+from pathlib import Path
+
+path = Path("azure/terraform/main.tf")
+text = path.read_text()
+
+text = text.replace(
+    '''  # Require IMDSv2-style metadata access protections where supported by Azure.
+  # Azure's managed VM metadata service is not directly equivalent to AWS IMDSv2.
+  # The VM uses Azure platform defaults for instance metadata.
+
+''',
+    ""
+)
+
+text = text.replace(
+    "# Use a 30 GiB standard SSD/HDD-compatible managed OS disk.",
+    "# Use a 30 GiB standard locally redundant managed OS disk."
+)
+
+path.write_text(text)
+print("Reviewed Azure VM comments.")
+PY
+
+# Format the Terraform files consistently.
+terraform fmt -recursive azure/terraform
+
+# Get your current public IPv4 address.
+MY_IP="$(curl -4 -fsS https://checkip.amazonaws.com | tr -d '[:space:]')"
+
+# Validate the address before using it in the SSH firewall rule.
+python3 - "$MY_IP" <<'PY'
+import ipaddress
+import sys
+from pathlib import Path
+
+# Reject invalid IP addresses before writing the Terraform variables.
+ip = ipaddress.IPv4Address(sys.argv[1])
+tfvars = Path("azure/terraform/terraform.tfvars")
+
+# Avoid silently overwriting an existing local configuration.
+if tfvars.exists():
+    raise SystemExit(
+        f"{tfvars} already exists. Review it and update trusted_ssh_cidr manually."
+    )
+
+# Write local-only settings; .gitignore excludes terraform.tfvars.
+tfvars.write_text(
+    'location         = "eastus"\n'
+    'subscription_id  = "00000000-0000-0000-0000-000000000000"\n'
+    'project_name     = "linux-hardening"\n'
+    'vm_size          = "Standard_B1s"\n'
+    f'trusted_ssh_cidr = "{ip}/32"\n'
+    'public_key_path  = "~/.ssh/linux_hardening_ed25519.pub"\n'
+)
+
+print(f"Created {tfvars} with trusted SSH CIDR {ip}/32")
+PY
+```
+
+## Validate before deploying
+
+```bash
+cd ~/projects/linux-server-hardening
+
+# Confirm the Azure CLI has an active login and subscription.
+az account show --query '{name:name,id:id,tenantId:tenantId}' --output table
+
+# Supply the active subscription ID to the Azure Terraform provider.
+export ARM_SUBSCRIPTION_ID="$(az account show --query id --output tsv)"
+
+# Check the deployment script's Bash syntax.
+bash -n scripts/deploy-azure.sh
+
+# Initialize the Azure Terraform provider.
+terraform -chdir=azure/terraform init
+
+# Check the Terraform configuration for errors.
+terraform -chdir=azure/terraform validate
+```
+
+## AWS validation
+
+1, Confirm the EC2 instance is Healthy
+
+```bash
+# Read the instance ID and public IP from Terraform outputs.
+AWS_INSTANCE_ID="$(terraform -chdir=aws/terraform output -raw instance_id)"
+AWS_IP="$(terraform -chdir=aws/terraform output -raw instance_public_ip)"
+
+# Verify the EC2 instance is running and inspect its security settings.
+aws ec2 describe-instances \
+  --instance-ids "$AWS_INSTANCE_ID" \
+  --query 'Reservations[0].Instances[0].[State.Name,InstanceType,PublicIpAddress,PrivateIpAddress,MetadataOptions.HttpTokens,BlockDeviceMappings[0].Ebs.Encrypted,SecurityGroups[*].GroupId]' \
+  --output table
+```
+
+## Success criteria
+
+- Instance state is running.
+- Public and private IP addresses are assigned.
+- HttpTokens is required, indicating IMDSv2 is required.
+- The root EBS volume reports True for encryption.
+- A security group is attached.
+
+2, Verify the AWS SSH security group
+
+```bash
+# Find the security group attached to the EC2 instance.
+AWS_SG_ID="$(aws ec2 describe-instances \
+  --instance-ids "$AWS_INSTANCE_ID" \
+  --query 'Reservations[0].Instances[0].SecurityGroups[0].GroupId' \
+  --output text)"
+
+# Inspect inbound rules to ensure SSH is restricted.
+aws ec2 describe-security-groups \
+  --group-ids "$AWS_SG_ID" \
+  --query 'SecurityGroups[0].IpPermissions' \
+  --output json
+```
+
+- Success criteria
+
+- TCP port 22 is allowed only from your trusted public IP in /32 format.
+- There should not be an SSH rule open to 0.0.0.0/0 or ::/0
+
+3 Validate the Linux server with
+
+- Your deployment script removes its temporary inventory when it exits. Recreate one for testing
+
+```bash
+# Create a temporary inventory using AWS's initial Ubuntu account.
+AWS_INVENTORY="$(mktemp)"
+
+cat > "$AWS_INVENTORY" <<EOF
+[linux_servers]
+aws-linux ansible_host=${AWS_IP} ansible_user=ubuntu ansible_python_interpreter=/usr/bin/python3 ansible_ssh_private_key_file=${HOME}/.ssh/linux_hardening_ed25519 ansible_ssh_common_args='-o StrictHostKeyChecking=accept-new'
+EOF
+
+# Confirm SSH connectivity before running the checks.
+ansible -i "$AWS_INVENTORY" linux_servers \
+  -m ansible.builtin.wait_for_connection \
+  -a "timeout=600" \
+  -o
+
+# Run the read-only hardening validation playbook.
+ansible-playbook \
+  -i "$AWS_INVENTORY" \
+  ansible/playbooks/validate.yml
+```
+
+## Azure Validation
+
+A. Confirm the Azure VM is running
+
+```bash
+cd ~/projects/linux-server-hardening
+
+# Read the Azure resource group, VM name, and public IP from Terraform.
+AZURE_RG="$(terraform -chdir=azure/terraform output -raw resource_group_name)"
+AZURE_VM="$(terraform -chdir=azure/terraform output -raw vm_name)"
+AZURE_IP="$(terraform -chdir=azure/terraform output -raw public_ip)"
+
+# Verify the VM's power state.
+az vm get-instance-view \
+  --resource-group "$AZURE_RG" \
+  --name "$AZURE_VM" \
+  --query 'instanceView.statuses[].displayStatus' \
+  --output table
+
+# Show the VM's provisioned size and current state.
+az vm show \
+  --resource-group "$AZURE_RG" \
+  --name "$AZURE_VM" \
+  --show-details \
+  --query '{name:name,size:hardwareProfile.vmSize,powerState:powerState,publicIp:publicIps,privateIp:privateIps}' \
+  --output table
+```
+
+Success criteria:
+
+- VM provisioning completes.
+- Power state is VM running.
+- Public and private IP addresses are assigned.
+- VM size matches your approved Terraform configuration.
+
+B. Inspect Azure's inbound SSH rule
+
+```bash
+# Inspect the network security group rules created by Terraform.
+az network nsg rule list \
+  --resource-group "$AZURE_RG" \
+  --nsg-name linux-hardening-nsg \
+  --query '[].{name:name,priority:priority,direction:direction,access:access,protocol:protocol,source:sourceAddressPrefix,port:destinationPortRange}' \
+  --output table
+```
+
+- Success criteria: the inbound SSH rule allows TCP port 22 only from your trusted /32 IP. Other unsolicited inbound connections should remain denied by the NSG's default rules.
+
+C. Validate the Azure Linux server with Ansible
+
+```bash
+# Create a temporary inventory using Azure's initial administrator account.
+AZURE_INVENTORY="$(mktemp)"
+
+cat > "$AZURE_INVENTORY" <<EOF
+[linux_servers]
+azure-linux ansible_host=${AZURE_IP} ansible_user=azureuser ansible_python_interpreter=/usr/bin/python3 ansible_ssh_private_key_file=${HOME}/.ssh/linux_hardening_ed25519 ansible_ssh_common_args='-o StrictHostKeyChecking=accept-new'
+EOF
+
+# Wait for SSH connectivity before running Ansible.
+ansible -i "$AZURE_INVENTORY" linux_servers \
+  -m ansible.builtin.wait_for_connection \
+  -a "timeout=600" \
+  -o
+
+# Run the shared, read-only validation playbook.
+ansible-playbook \
+  -i "$AZURE_INVENTORY" \
+  ansible/playbooks/validate.yml
+```
