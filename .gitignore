@@ -30,3 +30,4 @@ id_ed25519
 # Ansible runtime files
 *.retry
 ansible/group_vars/vault.yml
+/Training.md
