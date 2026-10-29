@@ -1,0 +1,141 @@
+```groovy
+pipeline {
+    agent any
+
+    options {
+        // Keep logs readable and avoid concurrent changes to shared state.
+        timestamps()
+        disableConcurrentBuilds()
+        buildDiscarder(logRotator(numToKeepStr: '20'))
+    }
+
+    environment {
+        TF_IN_AUTOMATION = 'true'
+        TF_INPUT = 'false'
+        ANSIBLE_HOST_KEY_CHECKING = 'False'
+    }
+
+    stages {
+        stage('Checkout') {
+            steps {
+                // Jenkins checks out the repository configured in the job.
+                checkout scm
+            }
+        }
+
+        stage('Check Required Tools') {
+            steps {
+                sh '''
+                    set -eu
+
+                    # Confirm required CI tools exist on the Jenkins agent.
+                    command -v git
+                    command -v terraform
+                    command -v ansible-playbook
+                    command -v ansible-lint
+
+                    terraform version
+                    ansible-playbook --version
+                    ansible-lint --version
+                '''
+            }
+        }
+
+        stage('Terraform Formatting') {
+            steps {
+                sh '''
+                    set -eu
+
+                    # Check cloud Terraform code without modifying the files.
+                    terraform fmt -check -recursive aws/terraform
+                    terraform fmt -check -recursive azure/terraform
+                '''
+            }
+        }
+
+        stage('Terraform Validation') {
+            steps {
+                sh '''
+                    set -eu
+
+                    # Validate each cloud root without accessing remote state.
+                    for root in aws/terraform azure/terraform; do
+                        if [ ! -d "$root" ]; then
+                            echo "ERROR: Missing Terraform directory: $root"
+                            exit 1
+                        fi
+
+                        echo "Validating $root"
+
+                        (
+                            cd "$root"
+                            terraform init -backend=false -input=false
+                            terraform validate
+                        )
+                    done
+                '''
+            }
+        }
+
+        stage('Ansible Lint') {
+            steps {
+                sh '''
+                    set -eu
+
+                    # Check role quality and common Ansible mistakes.
+                    ansible-lint ansible/roles/linux_hardening/
+                '''
+            }
+        }
+
+        stage('Ansible Syntax Check') {
+            steps {
+                withCredentials([
+                    file(
+                        credentialsId: 'ansible-vault-password-file',
+                        variable: 'VAULT_PASSWORD_FILE'
+                    )
+                ]) {
+                    sh '''
+                        set -eu
+
+                        # Let Ansible read the Vault password from a protected
+                        # Jenkins temporary file; never print or archive it.
+                        export ANSIBLE_VAULT_PASSWORD_FILE="$VAULT_PASSWORD_FILE"
+
+                        # Parse the playbook and its referenced variables without
+                        # connecting to or changing a Linux server.
+                        ansible-playbook \
+                            -i ansible/inventories/vagrant/hosts.yml \
+                            --syntax-check \
+                            ansible/playbooks/harden.yml
+                    '''
+                }
+            }
+        }
+    }
+
+    post {
+        success {
+            echo 'SUCCESS: Terraform and Ansible validation checks passed.'
+        }
+
+        failure {
+            echo 'FAILED: Review the logs and correct the validation errors.'
+        }
+
+        cleanup {
+            // Avoid retaining local Terraform state and plan files.
+            sh '''
+                rm -f \
+                    aws/terraform/terraform.tfstate \
+                    aws/terraform/terraform.tfstate.backup \
+                    aws/terraform/tfplan \
+                    azure/terraform/terraform.tfstate \
+                    azure/terraform/terraform.tfstate.backup \
+                    azure/terraform/tfplan
+            '''
+        }
+    }
+}
+```
